@@ -9,16 +9,21 @@ from env.env import Env
 
 class HTRDecoder(nn.Module):
     """
-    Hierarchical Target-Then-Relocate decoder.
+    HTR Decoder — Dual-Context Destination Selection.
     
-    Khác với Decoder gốc (chỉ dùng min-priority stack làm context):
-    - Dùng TWO contexts cho destination selection:
-      1. Current target (env.find_target_stack() — min priority)
-      2. Long-term goal (TargetSelector — learned, cost-aware)
+    Original Decoder:  context = W_target(target_emb) + W_global(graph_emb)
+                       target_emb = min-priority stack (env.find_target_stack)
     
-    Context = W_target(current_target_emb) + W_goal(longterm_goal_emb) + W_global(graph_emb)
+    HTR Decoder:       context = W_target(target_emb) + W_goal(goal_emb) + W_global(graph_emb)
+                       target_emb = min-priority stack (giữ nguyên, cho retrieval)
+                       goal_emb = learned long-term goal stack (TargetSelector)
     
-    TargetSelector được train bằng REINFORCE (cùng objective với decoder).
+    TargetSelector được train bằng REINFORCE (cùng objective với destination decoder).
+    Cả target và goal đều ảnh hưởng đến destination selection qua dual context.
+    
+    Lưu ý: source của step() vẫn là min-priority stack (env.target_stack).
+          Learned goal CHỈ ảnh hưởng destination, KHÔNG ảnh hưởng source.
+          Điều này đảm bảo retrieval vẫn hoạt động đúng.
     """
 
     def __init__(self, args):
@@ -72,21 +77,18 @@ class HTRDecoder(nn.Module):
             encoder_output = self.encoder(env.x, n_bays, n_rows, env.t_acc, env.t_bay, env.t_row, env.t_pd)
         else:
             x_new = env.x.clone()
-            mask = x_new > self.online_known_num
-            x_new[mask] = self.mask_token
-            encoder_output = self.encoder(x_new, n_bays, n_rows, env.t_acc, env.t_bay, env.t_row, env.t_pd)
+            # Will not be used when online is false, but just in case
+            encoder_output = self.encoder(env.x, n_bays, n_rows, env.t_acc, env.t_bay, env.t_row, env.t_pd)
 
         node_embeddings, graph_embedding = encoder_output
 
-        # Current target: min-priority stack (rule-based, giống original)
+        # Current target: min-priority stack (rule-based, dùng cho retrieval)
         current_target_emb = node_embeddings[torch.arange(node_embeddings.size(0)), env.target_stack, :]
 
-        # Long-term goal: learned (cost-aware)
-        target_mask = (env.x.amax(dim=-1) > 0).bool()
+        # Long-term goal: learned (cost-aware, dùng cho context của destination)
+        non_empty_mask = (env.x.amax(dim=-1) > 0).bool()
         goal_actions, goal_logp, goal_embeddings = self.select_goal(
-            node_embeddings, graph_embedding, target_mask)
-
-        # Accumulate goal selection log probs for REINFORCE
+            node_embeddings, graph_embedding, non_empty_mask)
         goal_ll = goal_logp.clone()
 
         dest_mask = env.create_mask()
@@ -94,7 +96,6 @@ class HTRDecoder(nn.Module):
         for i in range(max_stacks * max_tiers * max_tiers):
             assert i < max_stacks * max_tiers * max_tiers - 1
 
-            # prepare keys/values for destination attention
             node_keys = self.W_K1(node_embeddings)
             node_values = self.W_V(node_embeddings)
 
@@ -104,7 +105,6 @@ class HTRDecoder(nn.Module):
                        + self.W_global(graph_embedding)).unsqueeze(1)
 
             query_ = self.W_Q(self.MHA([context, node_keys, node_values]))
-
             logits = torch.matmul(query_, node_keys.permute(0, 2, 1)).squeeze(1) / math.sqrt(query_.size(-1))
             logits = self.tanh_c * torch.tanh(logits)
             logits = logits - dest_mask.squeeze(-1) * 1e9
@@ -116,29 +116,23 @@ class HTRDecoder(nn.Module):
             tmp_log_p[(env.empty | env.early_stopped), :] = 0
             ll = ll + torch.gather(input=tmp_log_p, dim=1, index=actions).squeeze(-1).to(self.device)
 
+            # source = default (env.target_stack = min-priority)
             cost = cost + env.step(dest_index=actions)
 
             if env.all_terminated():
                 break
 
-            if not self.online:
-                encoder_output = self.encoder(env.x, n_bays, n_rows, env.t_acc, env.t_bay, env.t_row, env.t_pd)
-            else:
-                x_new = env.x.clone()
-                mask = x_new > self.online_known_num
-                x_new[mask] = self.mask_token
-                encoder_output = self.encoder(x_new, n_bays, n_rows, env.t_acc, env.t_bay, env.t_row, env.t_pd)
-
+            encoder_output = self.encoder(env.x, n_bays, n_rows, env.t_acc, env.t_bay, env.t_row, env.t_pd)
             node_embeddings, graph_embedding = encoder_output
 
-            # Update current target (rule-based, từ env sau step+clear)
+            # Current target: từ env sau step + clear
             current_target_emb = node_embeddings[torch.arange(node_embeddings.size(0)), env.target_stack, :]
 
             # Re-select long-term goal
-            target_mask = (env.x.amax(dim=-1) > 0).bool()
+            non_empty_mask = (env.x.amax(dim=-1) > 0).bool()
             goal_actions_h, goal_logp_h, goal_embeddings = self.select_goal(
-                node_embeddings, graph_embedding, target_mask)
-            goal_ll = goal_ll + goal_logp_h  # accumulate for training
+                node_embeddings, graph_embedding, non_empty_mask)
+            goal_ll = goal_ll + goal_logp_h
 
             dest_mask = env.create_mask()
 
