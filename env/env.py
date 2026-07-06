@@ -173,6 +173,14 @@ class Env():
         else:
             return False
     
+    def set_target_stack(self, target_idx):
+        """Override target stack with external selection (HTR mode).
+
+        Args:
+            target_idx: (batch,) tensor of stack indices
+        """
+        self.target_stack = target_idx.to(self.device)
+
     def create_mask(self):
         top_val = self.x[:,:,-1]
         mask = torch.where(top_val>0, True, False).to(self.device)

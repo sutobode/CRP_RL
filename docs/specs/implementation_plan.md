@@ -1,340 +1,217 @@
-# Implementation Plan: Hierarchical Target-Then-Relocate (HTR)
+# Implementation Plan: HTR cho CRP_RL (Shin et al. 2026, TR-C)
 
-## Chiến Lược Phát Triển
+## 1. Phân Tích Baseline
 
-**Laptop (Windows):** Code + Smoke test — đảm bảo chạy đúng luồng, đúng kết quả
-**Colab (Linux + GPU):** Training thật + Experiments
+### 1.1 Codebase CRP_RL
 
-Mọi code phải chạy được cả trên Windows laptop lẫn Linux Colab.
+CRP_RL giải bài toán Container Retrieval Problem với mục tiêu tối thiểu hóa **working time**:
+
+```
+Working time = travel_time + acceleration_time + pickup_deposit_time
+             = (bay_diff * t_bay + row_diff * t_row + t_acc) + t_pd
+```
+
+### 1.2 Kiến Trúc Hiện Tại
+
+```
+Input: yard matrix (batch, n_bays, n_rows, n_tiers) với container priorities
+  │
+  ▼
+Encoder (LSTM + Self-Attention) → node_embeddings (mỗi stack) + graph_embedding (global)
+  │
+  ▼
+Decoder loop:
+  1. env.find_target_stack() → chọn stack có priority nhỏ NHẤT (RULE-BASED)
+  2. env.set_target_stack(target) 
+  3. Attention over stacks → chọn destination stack (LEARNED)
+  4. env.step(dest) → relocate + clear (tự động retrieve)
+  5. Re-encode state → lặp
+```
+
+### 1.3 Hạn Chế Chính
+
+| Hạn chế | Mô tả |
+|---------|-------|
+| **Target selection là rule-based** | `find_target_stack()` luôn chọn min-priority, không quan tâm working time cost |
+| **Không có cost-awareness** | Có thể chọn target xa crane hơn dù có stack gần hơn với priority gần tương đương |
+| **Không thể tối ưu working time qua target** | Chỉ tối ưu destination, không tối ưu target |
+
+### 1.4 Các Baseline Có Sẵn
+
+- Kim (2016)
+- Lin (2015)  
+- Durasevic (2025)
+- Leveling
+
+Tất cả đều dùng priority-based target selection. Không có baseline nào dùng learned target selection.
 
 ---
 
-## Phase 1: High-Level Environment (Laptop, ~2 ngày)
+## 2. Phương Pháp Đề Xuất: HTR (Hierarchical Target-Then-Relocate)
 
-### File: `env/high_level_env.py` (mới)
+### 2.1 Key Insight
 
-High-level MDP với action = target stack index.
+CRP có hai quyết định ở hai level khác nhau:
 
-```python
-class HighLevelCRPSPEnv:
-    """
-    Khác với baseline env:
-    - Action: stack index (0..S_y-1)
-    - step() thực hiện target selection + blocker relocation + transfer closure
-    - Reward: -số relocations trong macro-step này
-    """
+| Level | Quyết định | Hiện tại | Proposed |
+|-------|-----------|----------|----------|
+| **High** | Chọn stack nào làm target? | Rule-based (min priority) | **Learned policy** |
+| **Low** | Relocate top container đi đâu? | Learned (attention decoder) | Learned (giữ nguyên) |
+
+**Target selection hiện tại bỏ qua working time.** Một learned policy có thể học trade-off giữa:
+- **Urgency:** Container priority càng nhỏ càng cần retrieve sớm
+- **Travel cost:** Crane di chuyển đến stack đó tốn bao nhiêu working time
+- **Relocation cost:** Clear target đó cần relocate bao nhiêu container
+
+### 2.2 Kiến Trúc HTR
+
+```diff
+- Decoder hiện tại:
+    env.find_target_stack() [RULE] → decoder chọn dest
+
++ HTR Decoder:
+    TargetSelector [LEARNED] → env.set_target(target) → decoder chọn dest
 ```
 
-**Các method cần implement:**
-
-| Method | Mô tả | Smoke test |
-|--------|-------|------------|
-| `__init__` | Nhận low-level solver (heuristic/A*/beam), config | — |
-| `reset(instance)` | Reset yard, vessel, chạy transfer closure | 1 instance |
-| `step(action)` | Dọn target stack → reward + next state + done | 1 macro-step |
-| `_clear_target(stack_idx)` | Core logic: tìm target, gọi low-level solver | 1-2 cases |
-| `_is_transferable(c)` | Kiểm tra container có thể transfer ngay | Vài TH đơn giản |
-| `encode()` | State matrix (giống baseline) | — |
-| `action_mask()` | Mask các stack rỗng | — |
-
-**Kiến trúc:**
-
-```python
-class HighLevelCRPSPEnv:
-    def __init__(self, low_level_solver="heuristic", terminal_bonus=10.0):
-        self.low_level_solver = low_level_solver  # "heuristic" | "astar" | "beam"
-        self.terminal_bonus = terminal_bonus
-
-    def reset(self, instance):
-        self.inst = instance
-        self.yard = [list(s) for s in instance.yard]
-        self.vessel = [[] for _ in range(instance.s_v)]
-        self.slot_of = slot_map(instance)
-        self.n_relocations = 0
-        self.n_transfers = 0
-        self._transfer_closure()
-        self.done = all(not s for s in self.yard)
-        return self._obs(), self._mask()
-
-    def step(self, action):
-        # action = stack index to clear
-        stack_idx = action
-        # Find target = top container of chosen stack
-        if not self.yard[stack_idx]:
-            raise ValueError(f"Stack {stack_idx} is empty")
-        
-        target = self.yard[stack_idx][-1]
-        
-        if self._is_transferable(target):
-            # Direct transfer, no relocation needed
-            self._transfer(target)
-            reward = 0
-        else:
-            # Need to relocate blockers above target
-            blockers = self.yard[stack_idx][:-1]  # all except top
-            n_blk = len(blockers)
-            # Find destination for each blocker using low-level solver
-            if self.low_level_solver == "heuristic":
-                result = solve_blocker_relocation_heuristic(
-                    target, self.yard, self.slot_of, self.inst
-                )
-            elif self.low_level_solver == "astar":
-                result = solve_blocker_relocation_astar(
-                    target, self.yard, self.slot_of, self.inst
-                )
-            elif self.low_level_solver == "beam":
-                result = solve_blocker_relocation_beam(
-                    target, self.yard, self.slot_of, self.inst
-                )
-            # Apply relocation sequence
-            n_reloc = len(result)
-            for s, d in result:
-                self.yard[d].append(self.yard[s].pop())
-            self.n_relocations += n_reloc
-            reward = -n_reloc
-
-        # Transfer closure after relocation
-        self._transfer_closure()
-        self.done = all(not s for s in self.yard)
-        
-        if self.done:
-            reward += self.terminal_bonus
-
-        return self._obs(), self._mask(), reward, self.done, False, {}
+```
+Input: yard matrix
+  │
+  ▼
+Encoder (giữ nguyên) → node_embeddings + graph_embedding
+  │
+  ▼
+HIGH-LEVEL: TargetSelector(net(node_emb, graph_emb)) → target_stack_idx
+  │           MLP: [embed_dim*2 → 128 → 1] → softmax → sample
+  │
+  ▼
+env.set_target_stack(target_idx)
+  │
+  ▼
+LOW-LEVEL: Attention decoder (giữ nguyên) → destination_idx
+  │
+  ▼
+env.step(dest) → relocate + clear → next state
+  │
+  ▼
+Re-encode state → lặp HIGH-LEVEL
 ```
 
----
-
-## Phase 2: Low-Level Subproblem Solvers (Laptop, ~2 ngày)
-
-### File: `env/subproblem.py` (mới)
-
-Ba solver cho blocker relocation subproblem.
-
-### 2.1 Greedy Heuristic Solver
+### 2.3 TargetSelector Network
 
 ```python
-def solve_blocker_relocation_heuristic(target, yard, slot_of, inst):
+class TargetSelector(nn.Module):
     """
-    Ý tưởng: mỗi blocker, chọn destination stack ít tạo blocking pairs nhất.
-    Score = số container trong destination phải precede blocker.
+    Input:  node_embeddings (batch, n_stacks, embed_dim)
+            graph_embedding (batch, embed_dim)
+            mask (batch, n_stacks) — non-empty stacks
+    Output: logits (batch, n_stacks) — target scores
     """
+    embed_dim → concat(embed, global) → Linear(2*embed_dim, 128) → ReLU → Linear(128, 1)
 ```
 
-**Thuật toán:**
-1. Tìm stack s chứa target
-2. Với mỗi blocker b từ gần target nhất đi lên:
-   - Với mỗi destination d ≠ s, yard[d] chưa đầy:
-     - Score = count(c in yard[d] | must_precede(c, b))
-   - Chọn d có score thấp nhất → relocate b → d
-3. Trả về list các cặp (s, d)
+### 2.4 Training
 
-**Smoke test:** 5 instances, so sánh kết quả với baseline heuristic.
+Joint training (cả target selector và destination decoder cùng được train):
 
-### 2.2 A* Solver
+```
+forward() returns (cost, dest_ll, target_ll)
+  - cost = total working time của episode
+  - dest_ll = sum of log probs của destination actions (từ decoder)
+  - target_ll = sum of log probs của target actions (từ target selector)
 
-```python
-def solve_blocker_relocation_astar(target, yard, slot_of, inst):
-    """
-    Dùng A* của baseline để giải subproblem.
-    Subproblem = chỉ gồm blocker containers + target container.
-    Node limit = 500.
-    """
+loss = REINFORCE(cost, dest_ll + target_ll)
+  - Dùng POMO baseline (giống trainer.py hiện tại)
+  - total_ll = dest_ll + target_ll → backprop qua cả hai network
 ```
 
-**Thuật toán:**
-1. Tạo subproblem instance (copy yard, loại bỏ containers không liên quan)
-2. Gọi `solve_astar()` từ baseline với node_limit=500
-3. Trả về trajectory
-
-**Smoke test:** 5 instances, verify output format.
-
-### 2.3 Beam Search Solver
-
-```python
-def solve_blocker_relocation_beam(target, yard, slot_of, inst, beam_width=5):
-    """
-    Beam search: mỗi level = một blocker cần đặt.
-    Score = lower_bound sau khi apply partial assignment.
-    """
+Loss function chi tiết (POMO):
 ```
-
-**Smoke test:** 5 instances, beam_width = 1 (greedy) phải match heuristic.
-
----
-
-## Phase 3: High-Level Policy + PPO Training (Laptop + Colab)
-
-### File: `model/htr_agent.py` (mới)
-
-```python
-class HTRAgent:
-    """
-    High-level policy network.
-    Input: yard matrix (S_y x T_y) + vessel heights (S_v)
-    Network: RowSelfAttention (giống baseline) → flatten → Linear(128) → ReLU → Linear(S_y)
-    Output: action logits (S_y)
-    """
-```
-
-**Smoke test (laptop):** forward pass, action sampling, mask.
-
-### File: `trainer.py` (sửa — thêm HTR mode)
-
-PPO training loop cho HTR:
-- Kế thừa `compute_gae()` từ baseline PPO
-- Thay `CRPSPEnv` bằng `HighLevelCRPSPEnv`
-- Action dim = S_y (thay vì S_y·(S_y-1))
-- Thêm supervised warm-start phase
-
-```python
-def train_htr(cfg, device):
-    # Phase 1: Supervised warm-start (CPU, nhanh)
-    policy = HTRAgent(...)
-    optimizer = Adam(policy.parameters(), lr=cfg.lr)
-    
-    print("Phase 1: Generating A* demonstrations...")
-    demo_buffer = generate_demonstrations(n_instances=500, solver="astar")
-    # demo_buffer[i] = (obs, target_stack_idx)
-    
-    print("Phase 2: Behavioral cloning...")
-    for epoch in range(50):
-        loss = supervised_loss(policy, demo_buffer)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    
-    # Phase 3: PPO fine-tune
-    print("Phase 3: PPO fine-tune...")
-    env = HighLevelCRPSPEnv(low_level_solver="heuristic")
-    for iteration in range(cfg.iterations):
-        rollout_buffer = collect_rollouts(policy, env, cfg.instances_per_iter)
-        advantages, targets = compute_gae(rollout_buffer, cfg.gamma, cfg.gae_lambda)
-        # PPO update (same as baseline)
-        update_policy(policy, rollout_buffer, advantages, targets, cfg)
-```
-
-**Smoke test (laptop):**
-- 5 iterations PPO với N=5, S_y=3 (tiny)
-- Kiểm tra loss giảm, không crash
-- ~30 giây
-
-**Full training (Colab):**
-- N=15, S_y=5, 2000 iterations
-- ~2 GPU hours
-
----
-
-## Phase 4: Subproblem Evaluation (Laptop)
-
-### File: `benchmarks/evaluate_subproblem.py`
-
-So sánh 3 low-level solvers:
-
-| Solver | Quality (gap vs optimal A*) | Time (per subproblem) |
-|--------|---------------------------|----------------------|
-| Greedy heuristic | ~? | ~μs |
-| Beam width=3 | ~? | ~μs |
-| Beam width=5 | ~? | ~μs |
-| A* (node_limit=500) | 0% (optimal) | ~ms |
-
-**Smoke test (laptop):** 20 subproblems, verify tất cả solvers chạy được, output đúng format.
-
----
-
-## Phase 5: Full Comparison with Baseline (Colab)
-
-### File: `benchmarks/benchmark_htr.py`
-
-Chạy tất cả experiments so sánh HTR với baseline:
-
-| Experiment | Scale | Baseline methods | Metrics |
-|-----------|-------|-----------------|---------|
-| Table 4 replication | N=15, S_y=5 | PPO, A*, Voting | Gap, time |
-| Scaling test | N=30, S_y=6 | A*, PPO | Gap, solve rate |
-| Large scale | N=50, S_y=8 | A* (partial), PPO | Gap, solve rate |
-| Real scale | N=100, S_y=11 | None (first!) | Gap lower bound, time |
-
-### 5.1 Ablation Studies
-
-| Ablation | Configs | Questions |
-|----------|---------|----------|
-| Low-level solver | Greedy vs A* vs Beam(3) vs Beam(5) | Quality-speed tradeoff? |
-| High-level | HTR vs Random vs Priority-rule | Does RL help? |
-| Training solver | heuristic vs A* | Asymmetric training effect? |
-| Warm-start | With vs without BC | How much does warm-start help? |
-
----
-
-## Phase 6: Colab Deployment Script
-
-### File: `colab_train.ipynb`
-
-Script chạy trên Colab:
-
-```python
-# 1. Clone repo
-!git clone https://github.com/sutobode/CRP_RL.git
-%cd CRP_RL
-
-# 2. Install dependencies
-!pip install -r requirements.txt
-
-# 3. Run HTR training (N=15)
-!python trainer.py --mode htr --n 15 --s_y 5 --s_v 5 --t_y 5 \
-    --iterations 2000 --instances_per_iter 10 --lr 5e-4 \
-    --gamma 0.4 --gae_lambda 0.9 --clip_eps 0.15 \
-    --warm_start --warm_start_instances 500 \
-    --low_level_solver heuristic --out checkpoints/htr_n15.pt
-
-# 4. Run benchmark comparison
-!python benchmarks/benchmark_htr.py --ckpt checkpoints/htr_n15.pt \
-    --scales "15,5,5,5" "30,6,6,6" "50,8,8,6" "100,11,11,6" \
-    --output results/htr_results.csv
-
-# 5. Run ablations
-!python benchmarks/benchmark_htr.py --ablations \
-    --ckpt checkpoints/htr_n15.pt --output results/ablations.csv
+obj_reshaped = cost.view(batch/pomo, pomo)          # reshape theo POMO groups
+obj_mean = obj_reshaped.mean(dim=1)                 # baseline = mean của pomo trajectories
+obj_std = obj_reshaped.std(dim=1)                   # std normalization
+advantage = (obj_reshaped - obj_mean) / (obj_std + 1e-8)
+loss = (advantage * total_ll).mean()                # REINFORCE loss
 ```
 
 ---
 
-## Tổng Quan Files Cần Tạo/Sửa
+## 3. So Sánh Với Baseline
 
-| File | Trạng thái | Dòng | Laptop/Colab |
-|------|-----------|------|--------------|
-| `env/high_level_env.py` | **Mới** | ~120 | Laptop |
-| `env/subproblem.py` | **Mới** | ~120 | Laptop |
-| `model/htr_agent.py` | **Mới** | ~80 | Laptop |
-| `trainer.py` | **Sửa** | Thêm HTR mode ~100 | Cả hai |
-| `benchmarks/evaluate_subproblem.py` | **Mới** | ~60 | Laptop |
-| `benchmarks/benchmark_htr.py` | **Mới** | ~150 | Colab |
-| `colab_train.ipynb` | **Mới** | ~50 | Colab |
-
-**Total code mới:** ~680 dòng
-**Baseline code tái sử dụng (không sửa):** ~1500 dòng (instance.py, lower_bound.py, transfer.py, astar.py, heuristic.py, model/*, trainer.py base)
+| Yếu tố | CRP_RL gốc (Shin 2026) | HTR (Proposed) |
+|--------|------------------------|----------------|
+| **Target selection** | Rule-based: argmin priority | **Learned: cost-aware policy** |
+| **Destination selection** | Learned: attention decoder | Learned: attention decoder (giữ nguyên) |
+| **Working time cost** | Chỉ dùng làm reward | **Dùng làm training signal cho cả target + dest** |
+| **Novelty** | — | **First learned target selection cho CRP working time** |
 
 ---
 
-## Timeline
+## 4. Files Cần Tạo/Sửa
 
-| Phase | Nội dung | Thiết bị | Thời gian |
-|-------|----------|---------|-----------|
-| 1 | env/high_level_env.py | Laptop | 2 ngày |
-| 2 | env/subproblem.py + smoke test | Laptop | 2 ngày |
-| 3 | model/htr_agent.py + trainer.py HTR mode | Laptop | 2 ngày |
-| 4 | evaluate_subproblem.py benchmark | Laptop | 1 ngày |
-| 5 | benchmark_htr.py + colab script | Laptop | 1 ngày |
-| 6 | Full training + experiments | Colab | ~2 ngày |
-| 7 | Analysis + paper writing | Laptop | ~5 ngày |
-| **Total** | | | **~15 ngày** |
+### Files mới:
+
+| File | Dòng | Mục đích |
+|------|------|----------|
+| `model/target_selector.py` | ~20 | Target selection network |
+| `model/htr_decoder.py` | ~140 | Decoder với HTR target selection |
+
+### Files sửa:
+
+| File | Dòng sửa | Mục đích |
+|------|---------|----------|
+| `env/env.py` | +4 | Thêm `set_target_stack()` method |
+| `model/model.py` | ~20 | Thêm HTR mode switch |
+| `trainer.py` | ~20 | Thêm HTR training (handle target_logp) |
+| `main.py` | +1 | Thêm `--htr` flag |
+
+### Files không đụng:
+
+`env/`, `generator/`, `baselines/`, `benchmarks/`, `model/encoder.py`, `model/sampler.py`, `model/decoder.py`
 
 ---
 
-## Lưu Ý Kỹ Thuật
+## 5. Kế Hoạch Thực Thi
 
-1. **Cross-platform:** Dùng `os.path.join`, `pathlib.Path`, tránh hardcode Windows path
-2. **CUDA check:** `device = "cuda" if torch.cuda.is_available() else "cpu"` — tự động dùng GPU trên Colab
-3. **Random seed:** Fix seed cho reproducibility trên cả hai môi trường
-4. **Checkpoint:** Save model ở cuối mỗi phase, load được trên Colab
-5. **Dependency:** Chỉ dùng PyTorch + numpy (giống baseline), không thêm thư viện mới
+### Phase 1: Laptop (code + smoke test)
+
+| Task | File | Thời gian |
+|------|------|-----------|
+| 1.1 Tạo TargetSelector | `model/target_selector.py` | ~15 phút |
+| 1.2 Sửa env | `env/env.py` (thêm set_target_stack) | ~5 phút |
+| 1.3 Tạo HTRDecoder | `model/htr_decoder.py` | ~1 giờ |
+| 1.4 Sửa Model wrapper | `model/model.py` | ~10 phút |
+| 1.5 Sửa trainer | `trainer.py` (handle target_logp) | ~15 phút |
+| 1.6 Smoke test | Chạy 5 epochs N=35, batch=16 | ~5 phút |
+
+**Smoke test kỳ vọng:**
+- Code chạy không crash
+- Loss giảm dần (từ ~1000 xuống ~500 sau 5 epochs)
+- Target selector chọn target khác min-priority ít nhất 20% steps
+
+### Phase 2: Colab (training + benchmark)
+
+| Task | Config | Thời gian |
+|------|--------|-----------|
+| 2.1 Full training | 1000 epochs, batch=128, pomo=16 | ~12 giờ |
+| 2.2 Benchmark | Lee instances + Shin instances | ~1 giờ |
+| 2.3 So sánh baselines | Kim, Lin, Durasevic, Leveling | ~2 giờ |
+
+---
+
+## 6. Rủi Ro
+
+| Rủi ro | Khả năng | Giảm thiểu |
+|--------|---------|------------|
+| Target selector học được policy giống hệt rule-based (luôn chọn min priority) | Cao | Nếu xảy ra → ablation check: so sánh target selector vs rule-based |
+| Thêm network làm tăng training time | Trung bình | TargetSelector chỉ ~10K params, không đáng kể so với encoder |
+| HTRDecoder không tương thích POMO training | Thấp | Log prob được accumulate giống dest_ll, cùng REINFORCE loss |
+
+---
+
+## 7. Expected Results
+
+| Experiment | Expected improvement over baseline |
+|-----------|----------------------------------|
+| Lee benchmark (1 bay, 70 containers) | Working time giảm 5-10% |
+| Large instance (6 bays, 570 containers) | Working time giảm 10-15% (travel cost chiếm tỉ trọng lớn hơn) |
+| Upside-down instances | Working time giảm 3-5% (ít cơ hội tối ưu) |
