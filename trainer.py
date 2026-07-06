@@ -137,10 +137,19 @@ def train(model, optimizer, args, epoch):
                 if args.baseline in ['pomo', 'proposed']:
                     mini_expanded = mini.unsqueeze(1).expand(mini.shape[0], args.pomo_size, mini.shape[1], mini.shape[2], mini.shape[3])
                     mini_expanded = mini_expanded.reshape(mini.shape[0] * args.pomo_size, mini.shape[1], mini.shape[2], mini.shape[3])
-                    # wt: working time, ll: log likelihood
-                    wt, ll = model(mini_expanded.to(args.device))
+                    output = model(mini_expanded.to(args.device))
+                    if args.htr:
+                        wt, ll, target_ll = output
+                        ll = ll + target_ll  # combine target + destination log probs
+                    else:
+                        wt, ll = output
                 else:
-                    wt, ll = model(mini.to(args.device))
+                    output = model(mini.to(args.device))
+                    if args.htr:
+                        wt, ll, target_ll = output
+                        ll = ll + target_ll
+                    else:
+                        wt, ll = output
 
                 loss = get_loss(args, wt, ll, mini_batch_num) / args.n_layouts_per_batch / mini_batch_num
                 loss.backward()

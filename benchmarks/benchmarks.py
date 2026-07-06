@@ -51,7 +51,9 @@ def solve_benchmarks(model, epoch, args, instance_types):
                     inputs = torch.cat(inputs)
 
                     with torch.no_grad():
-                        wt, _ = model(inputs.to(args.device), None)
+                        wt = model(inputs.to(args.device), None)
+                        if isinstance(wt, tuple):
+                            wt = wt[0]
                     
                     name = names[0][:-8]
                     data_names.append(name)

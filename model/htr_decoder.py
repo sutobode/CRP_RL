@@ -11,13 +11,14 @@ class HTRDecoder(nn.Module):
     """
     Hierarchical Target-Then-Relocate decoder.
     
-    High-level: TargetSelector selects which stack to clear next.
-    Low-level: Attention-based decoder selects where to relocate blockers.
+    Khác với Decoder gốc (chỉ dùng min-priority stack làm context):
+    - Dùng TWO contexts cho destination selection:
+      1. Current target (env.find_target_stack() — min priority)
+      2. Long-term goal (TargetSelector — learned, cost-aware)
     
-    Khác với Decoder gốc:
-    - Không dùng env.find_target_stack() (rule-based min priority)
-    - Dùng TargetSelector (learned policy) để chọn target
-    - TargetSelector nhìn vào working time cost + priority
+    Context = W_target(current_target_emb) + W_goal(longterm_goal_emb) + W_global(graph_emb)
+    
+    TargetSelector được train bằng REINFORCE (cùng objective với decoder).
     """
 
     def __init__(self, args):
@@ -31,6 +32,7 @@ class HTRDecoder(nn.Module):
         self.target_selector = TargetSelector(args.embed_dim).to(self.device)
 
         self.W_target = nn.Linear(args.embed_dim, args.embed_dim, bias=False)
+        self.W_goal = nn.Linear(args.embed_dim, args.embed_dim, bias=False)
         self.W_global = nn.Linear(args.embed_dim, args.embed_dim, bias=False)
         self.W_K1 = nn.Linear(args.embed_dim, args.embed_dim, bias=False)
         self.W_K2 = nn.Linear(args.embed_dim, args.embed_dim, bias=False)
@@ -47,29 +49,14 @@ class HTRDecoder(nn.Module):
     def set_sampler(self, decode_type):
         self.sampler = self.samplers[decode_type]
 
-    def select_target(self, node_embeddings, graph_embedding, mask):
-        """High-level: chọn target stack dùng learned policy.
-        
-        Returns:
-            target_logp: log probability của target được chọn
-            target_embeddings: embedding của target stack
-        """
+    def select_goal(self, node_embeddings, graph_embedding, mask):
+        """Select long-term goal stack via learned policy."""
         logits = self.target_selector(node_embeddings, graph_embedding, mask)
         log_p = torch.log_softmax(logits, dim=1)
         actions = self.sampler(log_p)
         logp = torch.gather(log_p, dim=1, index=actions).squeeze(-1)
-        target_emb = node_embeddings[torch.arange(node_embeddings.size(0)), actions.squeeze(-1), :]
-        return actions, logp, target_emb
-
-    def select_destination(self, target_emb, graph_emb, node_emb, node_keys, node_vals, mask):
-        """Low-level: chọn destination stack dùng attention (giống Decoder gốc)."""
-        context = (self.W_target(target_emb) + self.W_global(graph_emb)).unsqueeze(1)
-        query_ = self.W_Q(self.MHA([context, node_keys, node_vals]))
-        logits = torch.matmul(query_, node_keys.permute(0, 2, 1)).squeeze(1) / math.sqrt(query_.size(-1))
-        logits = self.tanh_c * torch.tanh(logits)
-        logits = logits - mask.squeeze(-1) * 1e9
-        log_p = torch.log_softmax(logits, dim=1)
-        return log_p
+        goal_emb = node_embeddings[torch.arange(node_embeddings.size(0)), actions.squeeze(-1), :]
+        return actions, logp, goal_emb
 
     def forward(self, x, max_retrievals):
         batch, n_bays, n_rows, max_tiers = x.size()
@@ -91,15 +78,17 @@ class HTRDecoder(nn.Module):
 
         node_embeddings, graph_embedding = encoder_output
 
-        # action mask for target selection: non-empty stacks
+        # Current target: min-priority stack (rule-based, giống original)
+        current_target_emb = node_embeddings[torch.arange(node_embeddings.size(0)), env.target_stack, :]
+
+        # Long-term goal: learned (cost-aware)
         target_mask = (env.x.amax(dim=-1) > 0).bool()
-
-        # HTR: High-level target selection
-        target_actions, target_logp, target_embeddings = self.select_target(
+        goal_actions, goal_logp, goal_embeddings = self.select_goal(
             node_embeddings, graph_embedding, target_mask)
-        env.set_target_stack(target_actions)
 
-        # mask for destination selection (existing logic)
+        # Accumulate goal selection log probs for REINFORCE
+        goal_ll = goal_logp.clone()
+
         dest_mask = env.create_mask()
 
         for i in range(max_stacks * max_tiers * max_tiers):
@@ -109,10 +98,17 @@ class HTRDecoder(nn.Module):
             node_keys = self.W_K1(node_embeddings)
             node_values = self.W_V(node_embeddings)
 
-            # Low-level: select destination
-            log_p = self.select_destination(
-                target_embeddings, graph_embedding,
-                node_embeddings, node_keys, node_values, dest_mask)
+            # Dual-context destination selection
+            context = (self.W_target(current_target_emb)
+                       + self.W_goal(goal_embeddings)
+                       + self.W_global(graph_embedding)).unsqueeze(1)
+
+            query_ = self.W_Q(self.MHA([context, node_keys, node_values]))
+
+            logits = torch.matmul(query_, node_keys.permute(0, 2, 1)).squeeze(1) / math.sqrt(query_.size(-1))
+            logits = self.tanh_c * torch.tanh(logits)
+            logits = logits - dest_mask.squeeze(-1) * 1e9
+            log_p = torch.log_softmax(logits, dim=1)
 
             actions = self.sampler(log_p)
 
@@ -135,13 +131,15 @@ class HTRDecoder(nn.Module):
 
             node_embeddings, graph_embedding = encoder_output
 
-            # HTR: re-select target after each step
+            # Update current target (rule-based, từ env sau step+clear)
+            current_target_emb = node_embeddings[torch.arange(node_embeddings.size(0)), env.target_stack, :]
+
+            # Re-select long-term goal
             target_mask = (env.x.amax(dim=-1) > 0).bool()
-            target_actions_h, target_logp_h, target_embeddings = self.select_target(
+            goal_actions_h, goal_logp_h, goal_embeddings = self.select_goal(
                 node_embeddings, graph_embedding, target_mask)
-            target_logp = target_logp + target_logp_h  # accumulate for training
-            env.set_target_stack(target_actions_h)
+            goal_ll = goal_ll + goal_logp_h  # accumulate for training
 
             dest_mask = env.create_mask()
 
-        return cost, ll, target_logp  # return target_logp for auxiliary loss
+        return cost, ll, goal_ll
